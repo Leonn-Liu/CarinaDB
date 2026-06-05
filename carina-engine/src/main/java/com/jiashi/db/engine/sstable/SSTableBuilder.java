@@ -65,7 +65,7 @@ public class SSTableBuilder {
         }
         maxKey = Arrays.copyOf(key, key.length);
         bloomFilter.add(key);
-        if(dataBlockBuilder.add(key,value,type,pointer))
+        if(!dataBlockBuilder.add(key,value,type,pointer))
         {
             flushDataBlock();
             dataBlockBuilder.add(key,value,type,pointer);

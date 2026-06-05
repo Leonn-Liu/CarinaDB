@@ -244,7 +244,7 @@ public class CarinaEngine {
         flushExecutor.submit(() -> {
             try {
                 flushMemTableToDisk(tableToFlush);
-            } catch (IOException e) {
+            } catch (Exception e) {
                 System.err.println("后台刷盘致命失败: " + e.getMessage());
             }
         });
