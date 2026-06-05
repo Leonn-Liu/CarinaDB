@@ -25,10 +25,10 @@ public class Arena {
     private final long memoryStartAddress;
 
     public Arena(int size) {
-        // 事实1：向操作系统直接申请内存
+        // 向操作系统直接申请内存
         this.buffer = ByteBuffer.allocateDirect(size).order(ByteOrder.nativeOrder());
-        // 事实2：偏移量从 1 开始。在我们的跳表体系中，偏移量 0 具有特殊的语义，等同于 C 语言的 NULL 指针
-        this.allocateOffset = new AtomicInteger(1);
+        // 从 4（ALIGN_BYTES）起步而非 0/1：offset 0 保留为 NULL 哨兵，同时保证首个 baseOffset 即 4 对齐"
+        this.allocateOffset = new AtomicInteger(ALIGN_BYTES);
 
         try {
             // 事实：绕过访问控制，直接抓取 java.nio.Buffer 里的私有变量 address
@@ -109,12 +109,15 @@ public class Arena {
 
     public void putBytes(int offset, byte[] data) {
         // 使用绝对位置 API，而不是 buffer.put()，确保多线程并发读写同一块 Buffer 的不同区域时不会相互污染
+        // TODO(perf): 逐字节 put 太慢；改用 Unsafe.copyMemory(data, BYTE_ARRAY_BASE_OFFSET,
+        //   null, memoryStartAddress + offset, data.length) 一次性批量拷贝。见 BENCHMARKS.md §3 根因分析。
         for (int i = 0; i < data.length; i++) {
             buffer.put(offset + i, data[i]);
         }
     }
 
     public void getBytes(int offset, byte[] dest) {
+        // TODO(perf): 同 putBytes，逐字节 get 是寻路热路径的主要开销之一；改 Unsafe.copyMemory 批量拷贝。
         for (int i = 0; i < dest.length; i++) {
             dest[i] = buffer.get(offset + i);
         }

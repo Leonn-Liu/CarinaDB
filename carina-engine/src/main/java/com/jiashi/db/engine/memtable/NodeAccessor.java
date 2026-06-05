@@ -5,7 +5,7 @@ import com.jiashi.db.common.model.LogRecord;
 /**
  * 堆外跳表节点的物理寻址器
  * 物理内存布局事实：
- * [Type(1B)] [KeyLen(4B)] [ValLen(4B)] [PointerLen(4B)] [Height(4B)]  <-- 固定 Header 区 (17B)
+ * [Type(1B) + Pad(3B)] [KeyLen(4B)] [ValLen(4B)] [PointerLen(4B)] [Height(4B)]  <-- 固定 Header 区 (20B)
  * [NextPointers(Height * 4B)]                                         <-- 指针区 (紧随 Header)
  * [KeyBytes] [ValBytes] [PointerBytes]                                <-- 数据区
  */
@@ -15,12 +15,12 @@ public final class NodeAccessor {
 
     // --- 物理头部偏移量常量事实 ---
     private static final int TYPE_OFFSET = 0;
-    private static final int KEY_LEN_OFFSET = 1;
-    private static final int VAL_LEN_OFFSET = 5;
-    private static final int PTR_LEN_OFFSET = 9;
-    private static final int HEIGHT_OFFSET = 13;
+    private static final int KEY_LEN_OFFSET = 4;
+    private static final int VAL_LEN_OFFSET = 8;
+    private static final int PTR_LEN_OFFSET = 12;
+    private static final int HEIGHT_OFFSET = 16;
 
-    public static final int HEADER_SIZE = 17;
+    public static final int HEADER_SIZE = 20;
 
     public static int allocateAndWriteNode(Arena arena, LogRecord record, int height) {
         byte[] key = record.getKey();
@@ -94,6 +94,12 @@ public final class NodeAccessor {
 
     /**
      * 读取真实的 Key 字节数组
+     *
+     * TODO(perf): 寻路热路径（findPredecessors/getRecord）每次比较都调用本方法，
+     *   每次都 new 一个 byte[] 并逐字节从堆外拷贝 —— 这是 BENCHMARKS.md §3/§4 中
+     *   OffHeapSkipList 插入吞吐落后 ConcurrentSkipListMap ~2x、且反常触发 minor GC 的根因。
+     *   优化方向：新增 compareKeyAt(arena, baseOffset, targetKey) 直接对堆外字节与目标 key
+     *   逐字节比较、零中间分配（RocksDB Slice 视图思路），寻路时改调它而非 getKey。
      */
     public static byte[] getKey(Arena arena, int baseOffset) {
         int keyLen = getKeyLength(arena, baseOffset);
