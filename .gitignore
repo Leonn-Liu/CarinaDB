@@ -36,3 +36,10 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### CarinaDB 运行时 / 基准测试落盘产物（SSTable / WAL / vlog）###
+carina-data/
+carina-compaction-data/
+*.sst
+*.vlog
+wal_*.log
