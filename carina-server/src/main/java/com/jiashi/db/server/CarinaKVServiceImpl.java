@@ -22,7 +22,7 @@ public class CarinaKVServiceImpl implements CarinaKVService {
             if(key == null || value == null){
                 return false;
             }
-            engine.put(key, value);
+            engine.put(key, value,null);
             return true;
         }catch (IOException ex){
             System.err.println("网络层写入物理引擎失败" +  ex.getMessage());
