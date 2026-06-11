@@ -6,6 +6,7 @@ import com.jiashi.db.engine.blob.BlobPointer;
 import com.jiashi.db.engine.blob.BlobReader;
 import com.jiashi.db.engine.blob.BlobWriter;
 import com.jiashi.db.engine.compaction.Compactor;
+import com.jiashi.db.engine.index.hnsw.HnswIndex;
 import com.jiashi.db.engine.memtable.MemTable;
 import com.jiashi.db.engine.sstable.SSTableBuilder;
 import com.jiashi.db.engine.sstable.SSTableReader;
@@ -47,6 +48,11 @@ public class CarinaEngine {
     // ======== WiscKey 向量分离区 ========
     private final BlobWriter blobWriter;
     private final ConcurrentHashMap<Long, BlobReader> blobReaders = new ConcurrentHashMap<>();
+
+    // ======== 向量索引区 ========
+    private final HnswIndex hnswIndex;
+    private final AtomicInteger vectorIdGenerator = new AtomicInteger(0);
+    private final ConcurrentHashMap<Integer, byte[]> vectorIdToKey = new ConcurrentHashMap<>();
 
     // ======== 后台调度器 ========
     private final ExecutorService flushExecutor = Executors.newSingleThreadExecutor();
@@ -101,6 +107,8 @@ public class CarinaEngine {
         this.compactionDaemon.scheduleWithFixedDelay(this::backgroundCompaction, 10, 10, TimeUnit.SECONDS);
 
         System.out.println("CarinaDB 启动成功，已挂载 " + ssTables.size() + " 个 SSTable。");
+
+        this.hnswIndex = new HnswIndex(16, 200);
     }
 
     /**
@@ -117,6 +125,9 @@ public class CarinaEngine {
                 pointerBytes = pointer.toBytes();
                 type = LogRecordType.PUT_VECTOR;
             }
+            int vectorId = vectorIdGenerator.getAndIncrement();
+            vectorIdToKey.put(vectorId, key);
+            hnswIndex.insert(vectorId, vector);
         }
 
         // 先尝试写入当前 Active MemTable
@@ -190,6 +201,31 @@ public class CarinaEngine {
             }
         }
         return new QueryResult(value, vector);
+    }
+
+    /**
+     * 向量近似最近邻查询
+     * @param queryVector 查询向量
+     * @param k           返回的最近邻数量
+     * @return 距离最近的 k 个节点的完整数据
+     */
+    public List<QueryResult> searchVector(float[] queryVector, int k) throws IOException {
+        // 超额检索：HNSW 图不支持删除，已删 key 靠下面 query() 撞墓碑后过滤。
+        // 若只取 k 个，过滤后会凑不满，这里多要一倍、过滤后再截回 k 条。
+        List<HnswIndex.NodeDistance> hits = hnswIndex.search(queryVector, k * 2);
+
+        List<QueryResult> results = new ArrayList<>(k);
+        for (HnswIndex.NodeDistance hit : hits) {
+            byte[] key = vectorIdToKey.get(hit.nodeId);
+            if (key == null) continue;
+
+            QueryResult result = query(key);
+            if (result != null) {
+                results.add(result);
+                if (results.size() >= k) break;
+            }
+        }
+        return results;
     }
 
     /**
