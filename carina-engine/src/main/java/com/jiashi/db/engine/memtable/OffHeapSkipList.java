@@ -174,6 +174,13 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
                     currentOffset = nextOffset;
                     nextOffset = NodeAccessor.getNextOffset(arena, currentOffset, level);
                 }else if(cmp == 0){
+                    // 多版本事实：同 key 的新版本（含墓碑）永远插在等值区头部，
+                    // 但旧节点的塔可能更高——高层撞到的等值节点不保证是最新版本。
+                    // 因此高层命中只能当作 >= 处理继续降层，唯有 Level 0 等值区的
+                    // 第一个节点才是最新版本，可以放心返回。
+                    if (level > 0) {
+                        break;
+                    }
                     byte type = NodeAccessor.getType(arena, nextOffset);
                     int valLen = NodeAccessor.getValueLength(arena, nextOffset);
                     byte[] value = new byte[valLen];
