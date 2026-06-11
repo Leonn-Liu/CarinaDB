@@ -210,9 +210,83 @@ java -Xmx2g -XX:MaxDirectMemorySize=2g --add-opens java.base/java.nio=ALL-UNNAME
 
 ---
 
+## 7. 向量检索：HNSW vs SIMD 暴力全扫（recall@10 / QPS）（2026-06-11）
+
+**被测**：`HnswIndex`（M=16, efConstruction=200，查询 ef 暂固定 = efC）与 `CarinaEngine.searchVector` 端到端链路（HNSW 图搜索 → vectorId 反查 key → `query(key)` 二次寻址 + 墓碑过滤）。对照组 = `VectorMath` SIMD 暴力全扫的精确 topK（recall 定义为 1.0）。
+
+**方法**：自研 harness × 2，固定种子可复现。`VectorSearchBenchmark`：端到端单点（N=2 万，128 维，K=10，1000 次查询，200 次预热）。`HnswScalingBenchmark`：纯索引规模扫描（N=2 万→20 万，300 次查询/档），支持两种数据分布——`uniform`（128 维均匀随机，ANN 最恶劣输入）与 `manifold`（本征维度 16 的高斯流形线性嵌入 128 维 + 1% 噪声，模拟真实 embedding 的低维流形结构）。
+
+**前置正确性门禁**：`VectorPipelineCorrectnessTest` 全绿——点查 vlog 往返逐元素无损、recall@10 = 0.998（N=3000）、自查询 top-1 100%、删除墓碑过滤零幽灵、删除后超额检索补位仍满额返回（recall 0.996）。
+
+> ⚠️ **本基准 + 正确性测试首跑共揪出 4 个 bug**（详见分析 4）：其中一个是**藏在存储引擎跳表里的多版本读取 bug**——同 key 新版本插在等值区头部，但 `OffHeapSkipList.getRecord` 在高层撞到等值 key 就短路返回，旧节点塔更高时墓碑被绕过（删除偶发失效，25% 升层概率下随机复现）。向量全链路测试把它逼了出来。
+
+**复跑**：
+```bash
+mvn -pl carina-engine -am test-compile
+CP="carina-engine/target/test-classes:carina-engine/target/classes:carina-common/target/classes"
+# 正确性门禁
+java --add-modules jdk.incubator.vector --add-opens java.base/java.nio=ALL-UNNAMED \
+  -cp "$CP" com.jiashi.db.engine.VectorPipelineCorrectnessTest
+# 端到端单点（N=2 万）
+java --add-modules jdk.incubator.vector --add-opens java.base/java.nio=ALL-UNNAMED \
+  -cp "$CP" com.jiashi.db.engine.VectorSearchBenchmark
+# 规模扫描（uniform / manifold 两种分布）
+java -Xmx3g --add-modules jdk.incubator.vector -cp "$CP" \
+  com.jiashi.db.engine.index.hnsw.HnswScalingBenchmark uniform
+java -Xmx3g --add-modules jdk.incubator.vector -cp "$CP" \
+  com.jiashi.db.engine.index.hnsw.HnswScalingBenchmark manifold
+```
+
+**结果 1 —— 端到端单点（N=2 万，uniform）**：
+
+| 指标 | 值 |
+|------|-----|
+| 纯 HNSW 建图 | 9.8 s（491 µs/条，单线程） |
+| 引擎端到端写入 | 102 ops/s（fsync 主导，与 §2/§5 同源） |
+| 暴力全扫 | 211 µs/次，**4,741 QPS** |
+| 端到端 `searchVector` | 462 µs/次，**2,165 QPS**，recall@10 = 0.904 |
+
+注：本档（2 万条）暴力反而更快——见分析 2 的交叉点；纯 HNSW 与端到端的差值在建图随机性 + JIT 噪声范围内，KV 打捞开销很小（数据全驻 MemTable）。
+
+**结果 2 —— 规模扫描，uniform 分布（最恶劣输入）**：
+
+| N | 建图(s) | 暴力 (µs/q) | HNSW (µs/q) | 加速比 | recall@10 |
+|---|--------|------------|------------|--------|-----------|
+| 20,000 | 10.1 | 205 | 385 | 0.53× | 0.907 |
+| 50,000 | 32.7 | 535 | 497 | **1.08×** | 0.781 |
+| 100,000 | 77.6 | 1,292 | 673 | 1.92× | 0.660 |
+| 200,000 | 187.1 | 2,762 | 750 | **3.68×** | 0.540 |
+
+**结果 3 —— 规模扫描，manifold 分布（本征 16 维，接近真实 embedding）**：
+
+| N | 建图(s) | 暴力 (µs/q) | HNSW (µs/q) | 加速比 | recall@10 |
+|---|--------|------------|------------|--------|-----------|
+| 20,000 | 4.8 | 216 | 255 | 0.85× | **1.0000** |
+| 50,000 | 16.8 | 601 | 453 | 1.33× | 0.9997 |
+| 100,000 | 44.8 | 1,287 | 558 | 2.31× | 0.9997 |
+| 200,000 | 114.3 | 2,959 | 626 | **4.73×** | **1.0000** |
+
+**分析**：
+
+1. **交叉点 ≈ 3.5–5 万条**：暴力全扫严格 O(N)（205→2,762 µs，13.5× 线性增长），HNSW 近似平坦（385→750 µs，仅 1.9×）。2 万条以下 SIMD 暴力扫连续内存反而更快——HNSW 的指针跳跃 + 装箱 `Integer` 邻接表常数项大；规模越大 HNSW 优势越大，且差距随 N 持续拉开。**结论：向量检索没有银弹，小库用暴力扫，大库才值得建图。**
+2. **recall 取决于数据分布，而非实现**：uniform 随机高维数据距离高度集中（维度灾难），recall 随 N 崩塌（0.91→0.54）；同一份代码在低本征维度流形数据上全档 recall ≈ 1.0。诊断过程留档：先后排除了图稀疏假设（实测 Level 0 平均度数 29.1/32、零孤立节点）与建图路由假设（修复 nextObj 前后 recall 无差异），最终用流形对照实验定位为数据特性——与 ann-benchmarks 社区在 random 数据集上的结论一致。真实 embedding（文本/图像）都躺在低维流形上，结果 3 更接近生产预期。
+3. **manifold 数据建图还快 39%**（114 s vs 187 s @ 20 万）：流形结构让贪心搜索更早收敛，searchLayer 访问的节点更少——建图成本同样受数据分布支配。
+4. **本轮测试驱动修复的 4 个 bug 留档**：
+   - `HnswIndex.insert` 注册时序 NPE：新节点先双向连边、后注册进 `nodes`，邻居溢出裁剪反查时必炸（3000 条必现）。修复：连边前注册（此时无入边，不影响搜索）。
+   - `OffHeapSkipList.getRecord` 多版本读取 bug（见上方警示框）：高层等值命中改为继续降层，仅信任 Level 0 等值区首节点。**这是存储引擎的正确性 bug，影响所有 delete-后-read 路径，不限于向量。**
+   - `searchVector` 删除后凑不满 K：HNSW 图不支持删除，靠 `query()` 撞墓碑过滤，过滤后结果可能 < K。修复：超额检索 2K 再截断。
+   - `insert` 下层入口用了大顶堆 `peek()`（最远候选）而非最近候选：已修为与论文一致；实测本数据集上 recall 无可测差异，作为正确性修复留档（修复前 uniform 四档 recall：0.906/0.783/0.672/0.545）。
+5. **查询 ef 是尚未开放的 recall/QPS 旋钮**：当前 `search` 复用 efConstruction(200) 做查询 ef。开放 efSearch 参数后，uniform 数据可用更大 ef 换 recall、manifold 数据可用更小 ef 换 QPS——列入待优化。
+
+**边界**：单线程、单次运行、Apple M 系列；HNSW 索引纯内存，**无持久化（重启不重建）、无并发插入保护、无图内删除**（删除一致性靠查询层墓碑过滤 + 超额检索兜底）；synthetic 数据（uniform 与 manifold 是两个极端，真实 embedding 介于其间偏后者）。换机/换数据集必重测。
+
+---
+
 ## 待优化 / 已知瓶颈
 
 - **`NodeAccessor.getKey` 寻路热路径每次比较都新分配 `byte[]` 并逐字节 `ByteBuffer.get` 拷贝**（§3/§4 慢的根因）。可改为：寻路比较时**直接对堆外字节与目标 key 逐字节比较，不分配中间数组**（类似 RocksDB 的 `Slice` 视图）；`Arena.getBytes/putBytes` 改 `Unsafe.copyMemory` 批量拷贝。预计能吃掉与 JDK 的大部分差距。— 属核心引擎代码，待作者本人实现。
+- **HNSW 查询 ef 不可调**（§7 分析 5）：`search` 复用 efConstruction 当查询 ef，应开放 `efSearch` 参数作为运行时 recall/QPS 旋钮。— 属核心索引代码，待作者本人实现。
+- **HNSW 对象图常数项大**（§7 分析 1 中 2 万条以下输给暴力扫的根因）：装箱 `Integer` 邻接表 + `HashSet` visited + 每跳堆分配。可压成 primitive 数组布局（hnswlib 做法：邻接表为 `int[]`、visited 为位图/epoch 数组）。— 属核心索引代码，待作者本人实现。
 
 ## 待补基准
 
@@ -221,4 +295,4 @@ java -Xmx2g -XX:MaxDirectMemorySize=2g --add-opens java.base/java.nio=ALL-UNNAME
 - [x] MemTable 并发写入 TPS（含 ARM 对齐回归实证）→ 见 §4
 - [x] 端到端引擎写入 / 查询（`CarinaEngineBenchmark`）→ 见 §5
 - [x] 百万级写入压出 L0→L1 多级 Compaction → 见 §6（首跑暴露并修复了 14× 磁盘膨胀 bug）
-- [ ] 向量检索 recall@K / QPS（待 `searchVector` 实现后；暴力 KNN vs HNSW 对比）
+- [x] 向量检索 recall@K / QPS（暴力 KNN vs HNSW，含规模扫描与数据分布对照）→ 见 §7（首跑揪出 4 个 bug，含 1 个存储引擎多版本读取 bug）
