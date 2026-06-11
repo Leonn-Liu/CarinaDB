@@ -43,3 +43,7 @@ carina-compaction-data/
 *.sst
 *.vlog
 wal_*.log
+carina-vector-test-data/
+carina-vector-bench-data/
+docs/
+CLAUDE.md

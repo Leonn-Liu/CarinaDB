@@ -181,7 +181,7 @@ java -Xmx2g -XX:MaxDirectMemorySize=2g --add-opens java.base/java.nio=ALL-UNNAME
   com.jiashi.db.engine.CompactionBenchmark
 ```
 
-> ⚠️ **本基准首跑（2026-06-05）暴露了一条 14× 磁盘膨胀的级联 bug**：磁盘爆到 7GB、L0 永不抽干、L1 无限增殖。完整排查与根因链见 [`docs/POSTMORTEM-compaction-disk-bloat.md`](docs/POSTMORTEM-compaction-disk-bloat.md)（源头是 `SSTableBuilder.add` 一个判反的 `if` + flush 异常被线程池静默吞掉）。下表记录**修复前 vs 修复后**两组数据，留作回归基线。
+> ⚠️ **本基准首跑（2026-06-05）暴露了一条 14× 磁盘膨胀的级联 bug**：磁盘爆到 7GB、L0 永不抽干、L1 无限增殖。完整排查与根因链见本地复盘文档 `docs/POSTMORTEM-compaction-disk-bloat.md`（不随仓库公开；源头是 `SSTableBuilder.add` 一个判反的 `if` + flush 异常被线程池静默吞掉）。下表记录**修复前 vs 修复后**两组数据，留作回归基线。
 
 **结果**（macOS APFS SSD）：
 
