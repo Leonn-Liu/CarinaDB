@@ -1,0 +1,3 @@
+add_library(carina_common INTERFACE)
+target_include_directories(carina_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(carina_common INTERFACE cxx_std_17)
